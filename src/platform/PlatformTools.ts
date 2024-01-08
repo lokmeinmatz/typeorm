@@ -112,6 +112,12 @@ export class PlatformTools {
                     return require("sqlite3")
 
                 /**
+                 * duckdb
+                 */
+                case "duckdb":
+                    return require("duckdb")
+
+                /**
                  * sql.js
                  */
                 case "sql.js":
