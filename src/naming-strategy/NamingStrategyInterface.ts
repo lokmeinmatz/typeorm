@@ -163,6 +163,11 @@ export interface NamingStrategyInterface {
     prefixTableName(prefix: string, tableName: string): string
 
     /**
+     * Gets a sequence name for the given table and column which has auto-increment option enabled. 
+     */
+    generatedIncrementSequenceName(tableName: string, columnName: string): string
+
+    /**
      * Column names for nested sets.
      */
     nestedSetColumnNames: { left: string; right: string }

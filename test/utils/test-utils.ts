@@ -390,8 +390,11 @@ export async function createTestingConnections(
     const dataSourceOptions = setupTestingConnections(options)
     const dataSources: DataSource[] = []
     for (let options of dataSourceOptions) {
+        console.warn("Creating connection for ", options.type)
         const dataSource = createDataSource(options)
+        console.warn("Initializing connection for ", options.type)
         await dataSource.initialize()
+        console.warn("Initialized connection for ", options.type)
         dataSources.push(dataSource)
     }
 

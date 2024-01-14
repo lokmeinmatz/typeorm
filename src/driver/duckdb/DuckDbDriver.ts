@@ -192,6 +192,8 @@ export class DuckDbDriver implements Driver {
 
     parametersPrefix: string = "$"
 
+    uuidGenerator = "gen_random_uuid()"
+
     maxAliasLength = 63 // same as postgres?
 
     // TODO check if this is true
@@ -307,7 +309,9 @@ export class DuckDbDriver implements Driver {
     }
 
     async connect(): Promise<void> {
+        console.warn("DuckDbDriver connect")
         this.databaseConnection = await this.createDatabaseConnection()
+        console.warn("DuckDbDriver connected")
     }
 
     createSchemaBuilder() {
@@ -858,7 +862,7 @@ export class DuckDbDriver implements Driver {
         }
 
         return await new Promise((ok, fail) => {
-            const db = new this.duckdb.Database(this.options.database, this.options.dbOptions as unknown as Record<string, string>, (err: duckdb.DuckDbError) => {
+            const db = new this.duckdb.Database(this.options.database, this.options.dbOptions as unknown as Record<string, string> ?? {}, (err: duckdb.DuckDbError) => {
                 if (err) return fail(err)
                 ok(db)
             })

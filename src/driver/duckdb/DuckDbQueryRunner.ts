@@ -16,13 +16,13 @@ import { TableForeignKey } from "../../schema-builder/table/TableForeignKey"
 import { TableIndex } from "../../schema-builder/table/TableIndex"
 import { TableUnique } from "../../schema-builder/table/TableUnique"
 import { View } from "../../schema-builder/view/View"
-import { IsolationLevel } from "../types/IsolationLevel"
 import { ObjectLiteral } from "../../common/ObjectLiteral"
 import type * as duckdb from "duckdb"
 import { InstanceChecker } from "../../util/InstanceChecker"
 import { MetadataTableType } from "../types/MetadataTableType"
 import { OrmUtils } from "../../util/OrmUtils"
 import { TableIndexOptions } from "../../schema-builder/options/TableIndexOptions"
+import { Query } from "../Query"
 
 /**
  * Runs queries on a single duckdb database connection.
@@ -31,13 +31,10 @@ import { TableIndexOptions } from "../../schema-builder/options/TableIndexOption
  * todo: need to throw exception for this case.
  */
 export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
-
     /**
      * Database driver used by connection.
      */
     driver: DuckDbDriver
-
-    protected databaseConnection: duckdb.Database
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -200,7 +197,7 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
                         tableColumn.isNullable = dbColumn["notnull"] === 0
                         // primary keys are numbered starting with 1, columns that aren't primary keys are marked with 0
                         tableColumn.isPrimary = dbColumn["pk"] > 0
-                        tableColumn.comment = "" // SQLite does not support column comments
+                        tableColumn.comment = "" // DuckDB does not support column comments
                         tableColumn.isGenerated =
                             autoIncrementColumnName === dbColumn["name"]
                         if (tableColumn.isGenerated) {
@@ -478,7 +475,6 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
         )
     }
 
-
     protected async loadTableRecords(
         tablePath: string,
         tableOrIndex: "table" | "index",
@@ -560,20 +556,20 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
         })
     }
 
-    async connect(): Promise<duckdb.Database> {
-        return this.databaseConnection
+    connect(): Promise<duckdb.Database> {
+        return Promise.resolve(this.driver.databaseConnection)
     }
 
     /**
      * Releases used database connection.
-     * We just clear loaded tables and sql in memory, because sqlite do not support multiple connections thus query runners.
+     * We just clear loaded tables and sql in memory, because duckdb do not support multiple connections thus query runners. // TODO multi connection support?
      */
     release(): Promise<void> {
         this.loadedTables = []
         this.clearSqlMemory()
         return Promise.resolve()
     }
-    
+
     async clearDatabase(database?: string): Promise<void> {
         let dbPath: string | undefined = undefined
         if (
@@ -584,7 +580,7 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
                 this.driver.getAttachedDatabaseHandleByRelativePath(database)
         }
 
-        await this.query(`PRAGMA foreign_keys = OFF`)
+        // await this.query(`PRAGMA foreign_keys = OFF`)
 
         const isAnotherTransactionActive = this.isTransactionActive
         if (!isAnotherTransactionActive) await this.startTransaction()
@@ -618,20 +614,25 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
             } catch (rollbackError) {}
             throw error
         } finally {
-            await this.query(`PRAGMA foreign_keys = ON`)
+            // await this.query(`PRAGMA foreign_keys = ON`)
         }
     }
-    
-    startTransaction(isolationLevel?: IsolationLevel): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    startTransaction(): Promise<void> {
+        return this.query("BEGIN TRANSACTION")
     }
     commitTransaction(): Promise<void> {
-        throw new Error("Method not implemented.")
+        return this.query("COMMIT")
     }
     rollbackTransaction(): Promise<void> {
-        throw new Error("Method not implemented.")
+        return this.query("ROLLBACK")
     }
-    stream(query: string, parameters?: any[], onEnd?: Function, onError?: Function): Promise<ReadStream> {
+    stream(
+        query: string,
+        parameters?: any[],
+        onEnd?: Function,
+        onError?: Function,
+    ): Promise<ReadStream> {
         throw new Error("Method not implemented.")
     }
     getDatabases(): Promise<string[]> {
@@ -652,9 +653,16 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
     getCurrentSchema(): Promise<string> {
         throw new Error("Method not implemented.")
     }
-    hasTable(table: string | Table): Promise<boolean> {
-        throw new Error("Method not implemented.")
+
+    public async hasTable(tableOrName: Table | string): Promise<boolean> {
+        const tableName = InstanceChecker.isTable(tableOrName)
+            ? tableOrName.name
+            : tableOrName
+        const sql = `SELECT * FROM information_schema.tables WHERE tables.table_name = ?`
+        const result = await this.query(sql, [tableName])
+        return result.length ? true : false
     }
+
     hasColumn(table: string | Table, columnName: string): Promise<boolean> {
         throw new Error("Method not implemented.")
     }
@@ -667,25 +675,807 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
     createSchema(schemaPath: string, ifNotExist?: boolean): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropSchema(schemaPath: string, ifExist?: boolean, isCascade?: boolean): Promise<void> {
+    dropSchema(
+        schemaPath: string,
+        ifExist?: boolean,
+        isCascade?: boolean,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createTable(table: Table, ifNotExist?: boolean, createForeignKeys?: boolean, createIndices?: boolean): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    /**
+     * Creates a new table.
+     */
+    public async createTable(
+        table: Table,
+        ifNotExist: boolean = false,
+        createForeignKeys: boolean = true,
+        createIndices: boolean = true,
+    ): Promise<void> {
+        const upQueries: Query[] = []
+        const downQueries: Query[] = []
+
+        if (ifNotExist) {
+            const isTableExist = await this.hasTable(table)
+            if (isTableExist) return Promise.resolve()
+        }
+
+        upQueries.push(this.createTableSql(table, createForeignKeys))
+        downQueries.push(this.dropTableSql(table))
+
+        if (createIndices) {
+            table.indices.forEach((index) => {
+                // new index may be passed without name. In this case we generate index name manually.
+                if (!index.name)
+                    index.name = this.connection.namingStrategy.indexName(
+                        table,
+                        index.columnNames,
+                        index.where,
+                    )
+                upQueries.push(this.createIndexSql(table, index))
+                downQueries.push(this.dropIndexSql(table, index))
+            })
+        }
+
+        // if table have column with generated type, we must add the expression to the metadata table
+        const generatedColumns = table.columns.filter(
+            (column) => column.generatedType && column.asExpression,
+        )
+
+        for (const column of generatedColumns) {
+            const insertQuery = this.insertTypeormMetadataSql({
+                table: table.name,
+                type: MetadataTableType.GENERATED_COLUMN,
+                name: column.name,
+                value: column.asExpression,
+            })
+
+            const deleteQuery = this.deleteTypeormMetadataSql({
+                table: table.name,
+                type: MetadataTableType.GENERATED_COLUMN,
+                name: column.name,
+            })
+
+            upQueries.push(insertQuery)
+            downQueries.push(deleteQuery)
+        }
+
+        await this.executeQueries(upQueries, downQueries)
     }
-    dropTable(table: string | Table, ifExist?: boolean, dropForeignKeys?: boolean, dropIndices?: boolean): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    /**
+     * Builds create index sql.
+     */
+    protected createIndexSql(table: Table, index: TableIndex): Query {
+        const columns = index.columnNames
+            .map((columnName) => `"${columnName}"`)
+            .join(", ")
+        const [database, tableName] = this.splitTablePath(table.name)
+        return new Query(
+            `CREATE ${index.isUnique ? "UNIQUE " : ""}INDEX ${
+                database ? `"${database}".` : ""
+            }${this.escapePath(index.name!)} ON "${tableName}" (${columns}) ${
+                index.where ? "WHERE " + index.where : ""
+            }`,
+        )
     }
-    createView(view: View, syncWithMetadata?: boolean, oldView?: View): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    /**
+     * Builds drop index sql.
+     */
+    protected dropIndexSql(
+        table: Table | View,
+        indexOrName: TableIndex | string,
+    ): Query {
+        let indexName = InstanceChecker.isTableIndex(indexOrName)
+            ? indexOrName.name
+            : indexOrName
+        const concurrent = InstanceChecker.isTableIndex(indexOrName)
+            ? indexOrName.isConcurrent
+            : false
+        const { schema } = this.driver.parseTableName(table)
+        return schema
+            ? new Query(
+                  `DROP INDEX ${
+                      concurrent ? "CONCURRENTLY" : ""
+                  }"${schema}"."${indexName}"`,
+              )
+            : new Query(
+                  `DROP INDEX ${
+                      concurrent ? "CONCURRENTLY" : ""
+                  }"${indexName}"`,
+              )
     }
-    dropView(view: string | View): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    /**
+     * Builds create table sql.
+     */
+    protected createTableSql(table: Table, createForeignKeys?: boolean): Query {
+        const columnDefinitions = table.columns
+            .map((column) => this.buildCreateColumnSql(table, column))
+            .join(", ")
+        let sql = `CREATE TABLE ${this.escapePath(table)} (${columnDefinitions}`
+
+        table.columns
+            .filter((column) => column.isUnique)
+            .forEach((column) => {
+                const isUniqueExist = table.uniques.some(
+                    (unique) =>
+                        unique.columnNames.length === 1 &&
+                        unique.columnNames[0] === column.name,
+                )
+                if (!isUniqueExist)
+                    table.uniques.push(
+                        new TableUnique({
+                            name: this.connection.namingStrategy.uniqueConstraintName(
+                                table,
+                                [column.name],
+                            ),
+                            columnNames: [column.name],
+                        }),
+                    )
+            })
+
+        if (table.uniques.length > 0) {
+            const uniquesSql = table.uniques
+                .map((unique) => {
+                    const uniqueName = unique.name
+                        ? unique.name
+                        : this.connection.namingStrategy.uniqueConstraintName(
+                              table,
+                              unique.columnNames,
+                          )
+                    const columnNames = unique.columnNames
+                        .map((columnName) => `"${columnName}"`)
+                        .join(", ")
+                    let constraint = `CONSTRAINT "${uniqueName}" UNIQUE (${columnNames})`
+                    if (unique.deferrable)
+                        constraint += ` DEFERRABLE ${unique.deferrable}`
+                    return constraint
+                })
+                .join(", ")
+
+            sql += `, ${uniquesSql}`
+        }
+
+        if (table.checks.length > 0) {
+            const checksSql = table.checks
+                .map((check) => {
+                    const checkName = check.name
+                        ? check.name
+                        : this.connection.namingStrategy.checkConstraintName(
+                              table,
+                              check.expression!,
+                          )
+                    return `CONSTRAINT "${checkName}" CHECK (${check.expression})`
+                })
+                .join(", ")
+
+            sql += `, ${checksSql}`
+        }
+
+        if (table.exclusions.length > 0) {
+            const exclusionsSql = table.exclusions
+                .map((exclusion) => {
+                    const exclusionName = exclusion.name
+                        ? exclusion.name
+                        : this.connection.namingStrategy.exclusionConstraintName(
+                              table,
+                              exclusion.expression!,
+                          )
+                    return `CONSTRAINT "${exclusionName}" EXCLUDE ${exclusion.expression}`
+                })
+                .join(", ")
+
+            sql += `, ${exclusionsSql}`
+        }
+
+        if (table.foreignKeys.length > 0 && createForeignKeys) {
+            const foreignKeysSql = table.foreignKeys
+                .map((fk) => {
+                    const columnNames = fk.columnNames
+                        .map((columnName) => `"${columnName}"`)
+                        .join(", ")
+                    if (!fk.name)
+                        fk.name = this.connection.namingStrategy.foreignKeyName(
+                            table,
+                            fk.columnNames,
+                            this.getTablePath(fk),
+                            fk.referencedColumnNames,
+                        )
+
+                    const referencedColumnNames = fk.referencedColumnNames
+                        .map((columnName) => `"${columnName}"`)
+                        .join(", ")
+
+                    let constraint = `CONSTRAINT "${
+                        fk.name
+                    }" FOREIGN KEY (${columnNames}) REFERENCES ${this.escapePath(
+                        this.getTablePath(fk),
+                    )} (${referencedColumnNames})`
+                    if (fk.onDelete) constraint += ` ON DELETE ${fk.onDelete}`
+                    if (fk.onUpdate) constraint += ` ON UPDATE ${fk.onUpdate}`
+                    if (fk.deferrable)
+                        constraint += ` DEFERRABLE ${fk.deferrable}`
+
+                    return constraint
+                })
+                .join(", ")
+
+            sql += `, ${foreignKeysSql}`
+        }
+
+        const primaryColumns = table.columns.filter(
+            (column) => column.isPrimary,
+        )
+        if (primaryColumns.length > 0) {
+            const primaryKeyName = primaryColumns[0].primaryKeyConstraintName
+                ? primaryColumns[0].primaryKeyConstraintName
+                : this.connection.namingStrategy.primaryKeyName(
+                      table,
+                      primaryColumns.map((column) => column.name),
+                  )
+
+            const columnNames = primaryColumns
+                .map((column) => `"${column.name}"`)
+                .join(", ")
+            sql += `, CONSTRAINT "${primaryKeyName}" PRIMARY KEY (${columnNames})`
+        }
+
+        sql += `)`
+        return new Query(sql)
     }
-    renameTable(oldTableOrName: string | Table, newTableName: string): Promise<void> {
-        throw new Error("Method not implemented.")
+
+    /**
+     * Builds drop table sql.
+     */
+    protected dropTableSql(
+        tableOrName: Table | string,
+        ifExist?: boolean,
+    ): Query {
+        const tableName = InstanceChecker.isTable(tableOrName)
+            ? tableOrName.name
+            : tableOrName
+        const query = ifExist
+            ? `DROP TABLE IF EXISTS ${this.escapePath(tableName)}`
+            : `DROP TABLE ${this.escapePath(tableName)}`
+        return new Query(query)
     }
-    changeTableComment(tableOrName: string | Table, comment?: string): Promise<void> {
+
+    protected createViewSql(view: View): Query {
+        if (typeof view.expression === "string") {
+            return new Query(`CREATE VIEW "${view.name}" AS ${view.expression}`)
+        } else {
+            return new Query(
+                `CREATE VIEW "${view.name}" AS ${view
+                    .expression(this.connection)
+                    .getQuery()}`,
+            )
+        }
+    }
+
+    /**
+     * Builds a query for create column.
+     */
+    protected buildCreateColumnSql(table: Table, column: TableColumn) {
+        let c = '"' + column.name + '"'
+        if (
+            column.isGenerated === true &&
+            column.generationStrategy !== "uuid"
+        ) {
+            if (column.generationStrategy === "identity") {
+                throw new Error(
+                    `Generation strategy "identity" is not supported by DuckDB. (table "${table.name}", column "${column.name}")`,
+                )
+            } else {
+                // classic SERIAL primary column
+                if (
+                    column.type === "integer" ||
+                    column.type === "int" ||
+                    column.type === "int4"
+                )
+                    c += " SERIAL"
+                if (column.type === "smallint" || column.type === "int2")
+                    c += " SMALLSERIAL"
+                if (column.type === "bigint" || column.type === "int8")
+                    c += " BIGSERIAL"
+            }
+        }
+        if (column.type === "enum" || column.type === "simple-enum") {
+            c += " " + this.buildEnumName(table, column)
+            if (column.isArray) c += " array"
+        } else if (!column.isGenerated || column.type === "uuid") {
+            c += " " + this.connection.driver.createFullType(column)
+        }
+
+        // Postgres only supports the stored generated column type
+        if (column.generatedType === "STORED" && column.asExpression) {
+            c += ` GENERATED ALWAYS AS (${column.asExpression}) STORED`
+        }
+
+        if (column.charset) c += ' CHARACTER SET "' + column.charset + '"'
+        if (column.collation) c += ' COLLATE "' + column.collation + '"'
+        if (column.isNullable !== true) c += " NOT NULL"
+        if (column.default !== undefined && column.default !== null)
+            c += " DEFAULT " + column.default
+        if (
+            column.isGenerated &&
+            column.generationStrategy === "uuid" &&
+            !column.default
+        )
+            c += ` DEFAULT ${this.driver.uuidGenerator}`
+
+        return c
+    }
+
+    /**
+     * Builds sequence name from given table and column.
+     */
+    protected buildSequenceName(
+        table: Table,
+        columnOrName: TableColumn | string,
+    ): string {
+        const { tableName } = this.driver.parseTableName(table)
+
+        const columnName = InstanceChecker.isTableColumn(columnOrName)
+            ? columnOrName.name
+            : columnOrName
+
+        let seqName = `${tableName}_${columnName}_seq`
+
+        if (seqName.length > this.connection.driver.maxAliasLength!) {
+            // note doesn't yet handle corner cases where .length differs from number of UTF-8 bytes
+            seqName = `${tableName.substring(0, 29)}_${columnName.substring(
+                0,
+                Math.max(29, 63 - table.name.length - 5),
+            )}_seq`
+        }
+
+        return seqName
+    }
+
+    protected buildSequencePath(
+        table: Table,
+        columnOrName: TableColumn | string,
+    ): string {
+        const { schema } = this.driver.parseTableName(table)
+
+        return schema
+            ? `${schema}.${this.buildSequenceName(table, columnOrName)}`
+            : this.buildSequenceName(table, columnOrName)
+    }
+
+    generatedIncrementSequenceName(
+        tableName: string,
+        columnName: string,
+    ): string {
+        return `seq_${tableName}_${columnName}`
+    }
+
+    /**
+     * Builds create ENUM type sql.
+     */
+    protected createEnumTypeSql(
+        table: Table,
+        column: TableColumn,
+        enumName?: string,
+    ): Query {
+        if (!enumName) enumName = this.buildEnumName(table, column)
+        const enumValues = column
+            .enum!.map((value) => `'${value.replace("'", "''")}'`)
+            .join(", ")
+        return new Query(`CREATE TYPE ${enumName} AS ENUM(${enumValues})`)
+    }
+
+    /**
+     * Builds ENUM type name from given table and column.
+     */
+    protected buildEnumName(
+        table: Table,
+        column: TableColumn,
+        withSchema: boolean = true,
+        disableEscape?: boolean,
+        toOld?: boolean,
+    ): string {
+        const { schema, tableName } = this.driver.parseTableName(table)
+        let enumName = column.enumName
+            ? column.enumName
+            : `${tableName}_${column.name.toLowerCase()}_enum`
+        if (schema && withSchema) enumName = `${schema}.${enumName}`
+        if (toOld) enumName = enumName + "_old"
+        return enumName
+            .split(".")
+            .map((i) => {
+                return disableEscape ? i : `"${i}"`
+            })
+            .join(".")
+    }
+
+    /**
+     * Drops the table.
+     */
+    async dropTable(
+        target: Table | string,
+        ifExist?: boolean,
+        dropForeignKeys: boolean = true,
+        dropIndices: boolean = true,
+    ): Promise<void> {
+        // It needs because if table does not exist and dropForeignKeys or dropIndices is true, we don't need
+        // to perform drop queries for foreign keys and indices.
+        if (ifExist) {
+            const isTableExist = await this.hasTable(target)
+            if (!isTableExist) return Promise.resolve()
+        }
+
+        // if dropTable called with dropForeignKeys = true, we must create foreign keys in down query.
+        const createForeignKeys: boolean = dropForeignKeys
+        const tablePath = this.getTablePath(target)
+        const table = await this.getCachedTable(tablePath)
+        const upQueries: Query[] = []
+        const downQueries: Query[] = []
+
+        if (dropIndices) {
+            table.indices.forEach((index) => {
+                upQueries.push(this.dropIndexSql(table, index))
+                downQueries.push(this.createIndexSql(table, index))
+            })
+        }
+
+        if (dropForeignKeys)
+            table.foreignKeys.forEach((foreignKey) =>
+                upQueries.push(this.dropForeignKeySql(table, foreignKey)),
+            )
+
+        upQueries.push(this.dropTableSql(table))
+        downQueries.push(this.createTableSql(table, createForeignKeys))
+
+        // if table had columns with generated type, we must remove the expression from the metadata table
+        const generatedColumns = table.columns.filter(
+            (column) => column.generatedType && column.asExpression,
+        )
+        for (const column of generatedColumns) {
+            const tableNameWithSchema = (
+                await this.getTableNameWithSchema(table.name)
+            ).split(".")
+            const tableName = tableNameWithSchema[1]
+            const schema = tableNameWithSchema[0]
+
+            const deleteQuery = this.deleteTypeormMetadataSql({
+                database: this.driver.options.database,
+                schema,
+                table: tableName,
+                type: MetadataTableType.GENERATED_COLUMN,
+                name: column.name,
+            })
+
+            const insertQuery = this.insertTypeormMetadataSql({
+                database: this.driver.options.database,
+                schema,
+                table: tableName,
+                type: MetadataTableType.GENERATED_COLUMN,
+                name: column.name,
+                value: column.asExpression,
+            })
+
+            upQueries.push(deleteQuery)
+            downQueries.push(insertQuery)
+        }
+
+        await this.executeQueries(upQueries, downQueries)
+    }
+
+    /**
+     * Creates a new view.
+     */
+    async createView(
+        view: View,
+        syncWithMetadata: boolean = false,
+    ): Promise<void> {
+        throw new Error("Method not implemented.")
+        // should be implemented like postgres
+    }
+
+    /**
+     * Drops the view.
+     */
+    async dropView(target: View | string): Promise<void> {
+        throw new Error("Method not implemented.")
+        // should be implemented like postgres
+    }
+
+
+    /**
+     * Get the table name with table schema
+     * Note: Without ' or "
+     */
+    protected async getTableNameWithSchema(target: Table | string) {
+        const tableName = InstanceChecker.isTable(target) ? target.name : target
+        if (tableName.indexOf(".") === -1) {
+            const schemaResult = await this.query(`SELECT current_schema()`)
+            const schema = schemaResult[0]["current_schema"]
+            return `${schema}.${tableName}`
+        } else {
+            return `${tableName.split(".")[0]}.${tableName.split(".")[1]}`
+        }
+    }
+
+    /**
+     * Renames the given table.
+     */
+    async renameTable(
+        oldTableOrName: Table | string,
+        newTableName: string,
+    ): Promise<void> {
+        const upQueries: Query[] = []
+        const downQueries: Query[] = []
+        const oldTable = InstanceChecker.isTable(oldTableOrName)
+            ? oldTableOrName
+            : await this.getCachedTable(oldTableOrName)
+        const newTable = oldTable.clone()
+
+        const { schema: schemaName, tableName: oldTableName } =
+            this.driver.parseTableName(oldTable)
+
+        newTable.name = schemaName
+            ? `${schemaName}.${newTableName}`
+            : newTableName
+
+        upQueries.push(
+            new Query(
+                `ALTER TABLE ${this.escapePath(
+                    oldTable,
+                )} RENAME TO "${newTableName}"`,
+            ),
+        )
+        downQueries.push(
+            new Query(
+                `ALTER TABLE ${this.escapePath(
+                    newTable,
+                )} RENAME TO "${oldTableName}"`,
+            ),
+        )
+
+        // rename column primary key constraint if it has default constraint name
+        if (
+            newTable.primaryColumns.length > 0 &&
+            !newTable.primaryColumns[0].primaryKeyConstraintName
+        ) {
+            const columnNames = newTable.primaryColumns.map(
+                (column) => column.name,
+            )
+
+            const oldPkName = this.connection.namingStrategy.primaryKeyName(
+                oldTable,
+                columnNames,
+            )
+
+            const newPkName = this.connection.namingStrategy.primaryKeyName(
+                newTable,
+                columnNames,
+            )
+
+            upQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${oldPkName}" TO "${newPkName}"`,
+                ),
+            )
+            downQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${newPkName}" TO "${oldPkName}"`,
+                ),
+            )
+        }
+
+        // rename sequences
+        newTable.columns.map((col) => {
+            if (col.isGenerated && col.generationStrategy === "increment") {
+                const sequencePath = this.buildSequencePath(oldTable, col.name)
+                const sequenceName = this.buildSequenceName(oldTable, col.name)
+
+                const newSequencePath = this.buildSequencePath(
+                    newTable,
+                    col.name,
+                )
+                const newSequenceName = this.buildSequenceName(
+                    newTable,
+                    col.name,
+                )
+
+                const up = `ALTER SEQUENCE ${this.escapePath(
+                    sequencePath,
+                )} RENAME TO "${newSequenceName}"`
+                const down = `ALTER SEQUENCE ${this.escapePath(
+                    newSequencePath,
+                )} RENAME TO "${sequenceName}"`
+
+                upQueries.push(new Query(up))
+                downQueries.push(new Query(down))
+            }
+        })
+
+        // rename unique constraints
+        newTable.uniques.forEach((unique) => {
+            const oldUniqueName =
+                this.connection.namingStrategy.uniqueConstraintName(
+                    oldTable,
+                    unique.columnNames,
+                )
+
+            // Skip renaming if Unique has user defined constraint name
+            if (unique.name !== oldUniqueName) return
+
+            // build new constraint name
+            const newUniqueName =
+                this.connection.namingStrategy.uniqueConstraintName(
+                    newTable,
+                    unique.columnNames,
+                )
+
+            // build queries
+            upQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${
+                        unique.name
+                    }" TO "${newUniqueName}"`,
+                ),
+            )
+            downQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${newUniqueName}" TO "${
+                        unique.name
+                    }"`,
+                ),
+            )
+
+            // replace constraint name
+            unique.name = newUniqueName
+        })
+
+        // rename index constraints
+        newTable.indices.forEach((index) => {
+            const oldIndexName = this.connection.namingStrategy.indexName(
+                oldTable,
+                index.columnNames,
+                index.where,
+            )
+
+            // Skip renaming if Index has user defined constraint name
+            if (index.name !== oldIndexName) return
+
+            // build new constraint name
+            const { schema } = this.driver.parseTableName(newTable)
+            const newIndexName = this.connection.namingStrategy.indexName(
+                newTable,
+                index.columnNames,
+                index.where,
+            )
+
+            // build queries
+            const up = schema
+                ? `ALTER INDEX "${schema}"."${index.name}" RENAME TO "${newIndexName}"`
+                : `ALTER INDEX "${index.name}" RENAME TO "${newIndexName}"`
+            const down = schema
+                ? `ALTER INDEX "${schema}"."${newIndexName}" RENAME TO "${index.name}"`
+                : `ALTER INDEX "${newIndexName}" RENAME TO "${index.name}"`
+            upQueries.push(new Query(up))
+            downQueries.push(new Query(down))
+
+            // replace constraint name
+            index.name = newIndexName
+        })
+
+        // rename foreign key constraints
+        newTable.foreignKeys.forEach((foreignKey) => {
+            const oldForeignKeyName =
+                this.connection.namingStrategy.foreignKeyName(
+                    oldTable,
+                    foreignKey.columnNames,
+                    this.getTablePath(foreignKey),
+                    foreignKey.referencedColumnNames,
+                )
+
+            // Skip renaming if foreign key has user defined constraint name
+            if (foreignKey.name !== oldForeignKeyName) return
+
+            // build new constraint name
+            const newForeignKeyName =
+                this.connection.namingStrategy.foreignKeyName(
+                    newTable,
+                    foreignKey.columnNames,
+                    this.getTablePath(foreignKey),
+                    foreignKey.referencedColumnNames,
+                )
+
+            // build queries
+            upQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${
+                        foreignKey.name
+                    }" TO "${newForeignKeyName}"`,
+                ),
+            )
+            downQueries.push(
+                new Query(
+                    `ALTER TABLE ${this.escapePath(
+                        newTable,
+                    )} RENAME CONSTRAINT "${newForeignKeyName}" TO "${
+                        foreignKey.name
+                    }"`,
+                ),
+            )
+
+            // replace constraint name
+            foreignKey.name = newForeignKeyName
+        })
+
+        // rename ENUM types
+        const enumColumns = newTable.columns.filter(
+            (column) => column.type === "enum" || column.type === "simple-enum",
+        )
+        for (let column of enumColumns) {
+            // skip renaming for user-defined enum name
+            if (column.enumName) continue
+
+            const oldEnumType = await this.getUserDefinedTypeName(
+                oldTable,
+                column,
+            )
+            upQueries.push(
+                new Query(
+                    `ALTER TYPE "${oldEnumType.schema}"."${
+                        oldEnumType.name
+                    }" RENAME TO ${this.buildEnumName(
+                        newTable,
+                        column,
+                        false,
+                    )}`,
+                ),
+            )
+            downQueries.push(
+                new Query(
+                    `ALTER TYPE ${this.buildEnumName(
+                        newTable,
+                        column,
+                    )} RENAME TO "${oldEnumType.name}"`,
+                ),
+            )
+        }
+        await this.executeQueries(upQueries, downQueries)
+    }
+
+        /**
+     * Builds drop foreign key sql.
+     */
+        protected dropForeignKeySql(
+            table: Table,
+            foreignKeyOrName: TableForeignKey | string,
+        ): Query {
+            const foreignKeyName = InstanceChecker.isTableForeignKey(
+                foreignKeyOrName,
+            )
+                ? foreignKeyOrName.name
+                : foreignKeyOrName
+            return new Query(
+                `ALTER TABLE ${this.escapePath(
+                    table,
+                )} DROP CONSTRAINT "${foreignKeyName}"`,
+            )
+        }
+
+    changeTableComment(
+        tableOrName: string | Table,
+        comment?: string,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
     addColumn(table: string | Table, column: TableColumn): Promise<void> {
@@ -694,76 +1484,151 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
     addColumns(table: string | Table, columns: TableColumn[]): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    renameColumn(table: string | Table, oldColumnOrName: string | TableColumn, newColumnOrName: string | TableColumn): Promise<void> {
+    renameColumn(
+        table: string | Table,
+        oldColumnOrName: string | TableColumn,
+        newColumnOrName: string | TableColumn,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    changeColumn(table: string | Table, oldColumn: string | TableColumn, newColumn: TableColumn): Promise<void> {
+    changeColumn(
+        table: string | Table,
+        oldColumn: string | TableColumn,
+        newColumn: TableColumn,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    changeColumns(table: string | Table, changedColumns: { oldColumn: TableColumn; newColumn: TableColumn }[]): Promise<void> {
+    changeColumns(
+        table: string | Table,
+        changedColumns: { oldColumn: TableColumn; newColumn: TableColumn }[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropColumn(table: string | Table, column: string | TableColumn): Promise<void> {
+    dropColumn(
+        table: string | Table,
+        column: string | TableColumn,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropColumns(table: string | Table, columns: string[] | TableColumn[]): Promise<void> {
+    dropColumns(
+        table: string | Table,
+        columns: string[] | TableColumn[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createPrimaryKey(table: string | Table, columnNames: string[], constraintName?: string): Promise<void> {
+    createPrimaryKey(
+        table: string | Table,
+        columnNames: string[],
+        constraintName?: string,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    updatePrimaryKeys(table: string | Table, columns: TableColumn[]): Promise<void> {
+    updatePrimaryKeys(
+        table: string | Table,
+        columns: TableColumn[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropPrimaryKey(table: string | Table, constraintName?: string): Promise<void> {
+    dropPrimaryKey(
+        table: string | Table,
+        constraintName?: string,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createUniqueConstraint(table: string | Table, uniqueConstraint: TableUnique): Promise<void> {
+    createUniqueConstraint(
+        table: string | Table,
+        uniqueConstraint: TableUnique,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createUniqueConstraints(table: string | Table, uniqueConstraints: TableUnique[]): Promise<void> {
+    createUniqueConstraints(
+        table: string | Table,
+        uniqueConstraints: TableUnique[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropUniqueConstraint(table: string | Table, uniqueOrName: string | TableUnique): Promise<void> {
+    dropUniqueConstraint(
+        table: string | Table,
+        uniqueOrName: string | TableUnique,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropUniqueConstraints(table: string | Table, uniqueConstraints: TableUnique[]): Promise<void> {
+    dropUniqueConstraints(
+        table: string | Table,
+        uniqueConstraints: TableUnique[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createCheckConstraint(table: string | Table, checkConstraint: TableCheck): Promise<void> {
+    createCheckConstraint(
+        table: string | Table,
+        checkConstraint: TableCheck,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createCheckConstraints(table: string | Table, checkConstraints: TableCheck[]): Promise<void> {
+    createCheckConstraints(
+        table: string | Table,
+        checkConstraints: TableCheck[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropCheckConstraint(table: string | Table, checkOrName: string | TableCheck): Promise<void> {
+    dropCheckConstraint(
+        table: string | Table,
+        checkOrName: string | TableCheck,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropCheckConstraints(table: string | Table, checkConstraints: TableCheck[]): Promise<void> {
+    dropCheckConstraints(
+        table: string | Table,
+        checkConstraints: TableCheck[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createExclusionConstraint(table: string | Table, exclusionConstraint: TableExclusion): Promise<void> {
+    createExclusionConstraint(
+        table: string | Table,
+        exclusionConstraint: TableExclusion,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createExclusionConstraints(table: string | Table, exclusionConstraints: TableExclusion[]): Promise<void> {
+    createExclusionConstraints(
+        table: string | Table,
+        exclusionConstraints: TableExclusion[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropExclusionConstraint(table: string | Table, exclusionOrName: string | TableExclusion): Promise<void> {
+    dropExclusionConstraint(
+        table: string | Table,
+        exclusionOrName: string | TableExclusion,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropExclusionConstraints(table: string | Table, exclusionConstraints: TableExclusion[]): Promise<void> {
+    dropExclusionConstraints(
+        table: string | Table,
+        exclusionConstraints: TableExclusion[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createForeignKey(table: string | Table, foreignKey: TableForeignKey): Promise<void> {
+    createForeignKey(
+        table: string | Table,
+        foreignKey: TableForeignKey,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    createForeignKeys(table: string | Table, foreignKeys: TableForeignKey[]): Promise<void> {
+    createForeignKeys(
+        table: string | Table,
+        foreignKeys: TableForeignKey[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropForeignKey(table: string | Table, foreignKeyOrName: string | TableForeignKey): Promise<void> {
+    dropForeignKey(
+        table: string | Table,
+        foreignKeyOrName: string | TableForeignKey,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropForeignKeys(table: string | Table, foreignKeys: TableForeignKey[]): Promise<void> {
+    dropForeignKeys(
+        table: string | Table,
+        foreignKeys: TableForeignKey[],
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
     createIndex(table: string | Table, index: TableIndex): Promise<void> {
@@ -772,7 +1637,10 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
     createIndices(table: string | Table, indices: TableIndex[]): Promise<void> {
         throw new Error("Method not implemented.")
     }
-    dropIndex(table: string | Table, index: string | TableIndex): Promise<void> {
+    dropIndex(
+        table: string | Table,
+        index: string | TableIndex,
+    ): Promise<void> {
         throw new Error("Method not implemented.")
     }
     dropIndices(table: string | Table, indices: TableIndex[]): Promise<void> {
@@ -782,18 +1650,45 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
         throw new Error("Method not implemented.")
     }
 
+    protected async getUserDefinedTypeName(table: Table, column: TableColumn) {
+        let { schema, tableName: name } = this.driver.parseTableName(table)
+
+        if (!schema) {
+            schema = await this.getCurrentSchema()
+        }
+
+        const result = await this.query(
+            `SELECT "udt_schema", "udt_name" ` +
+                `FROM "information_schema"."columns" WHERE "table_schema" = '${schema}' AND "table_name" = '${name}' AND "column_name"='${column.name}'`,
+        )
+
+        // docs: https://www.postgresql.org/docs/current/xtypes.html
+        // When you define a new base type, PostgreSQL automatically provides support for arrays of that type.
+        // The array type typically has the same name as the base type with the underscore character (_) prepended.
+        // ----
+        // so, we must remove this underscore character from enum type name
+        let udtName = result[0]["udt_name"]
+        if (udtName.indexOf("_") === 0) {
+            udtName = udtName.substr(1, udtName.length)
+        }
+        return {
+            schema: result[0]["udt_schema"],
+            name: udtName,
+        }
+    }
+
     /**
      * Called before migrations are run.
      */
     async beforeMigration(): Promise<void> {
-        await this.query(`PRAGMA foreign_keys = OFF`)
+        // await this.query(`PRAGMA foreign_keys = OFF`)
     }
 
     /**
      * Called after migrations are run.
      */
     async afterMigration(): Promise<void> {
-        await this.query(`PRAGMA foreign_keys = ON`)
+        // await this.query(`PRAGMA foreign_keys = ON`)
     }
 
     /**
@@ -806,6 +1701,7 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
     ): Promise<any> {
         if (this.isReleased) throw new QueryRunnerAlreadyReleasedError()
 
+        console.log("query", query, parameters)
         const connection = this.driver.connection
         const maxQueryExecutionTime = this.driver.options.maxQueryExecutionTime
         const broadcasterResult = new BroadcasterResult()
@@ -818,7 +1714,7 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
         )
 
         if (!connection.isInitialized) {
-            throw new ConnectionIsNotSetError("sqlite")
+            throw new ConnectionIsNotSetError("duckdb")
         }
 
         return new Promise(async (ok, fail) => {
@@ -832,13 +1728,21 @@ export class DuckDbQueryRunner extends BaseQueryRunner implements QueryRunner {
 
                 const execute = async () => {
                     if (isInsertQuery || isDeleteQuery || isUpdateQuery) {
-                        await databaseConnection.run(query, parameters, handler)
+                        await databaseConnection.run(
+                            query,
+                            ...(parameters ?? []),
+                            handler,
+                        )
                     } else {
-                        await databaseConnection.all(query, parameters, handler)
+                        await databaseConnection.all(
+                            query,
+                            ...(parameters ?? []),
+                            handler,
+                        )
                     }
                 }
 
-                const self = this;
+                const self = this
                 const handler = function (this: any, err: any, rows: any) {
                     // log slow queries if maxQueryExecution time is set
                     const queryEndTime = +new Date()

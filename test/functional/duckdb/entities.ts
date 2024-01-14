@@ -1,8 +1,8 @@
-import { Column, Entity, PrimaryColumn } from "../../../src"
+import { Column, Entity, PrimaryGeneratedColumn } from "../../../src"
 
 @Entity()
 export class Post {
-    @PrimaryColumn()
+    @PrimaryGeneratedColumn()
     id: number
 
     @Column()

@@ -4,15 +4,16 @@ import { DataSource } from "../../../src"
 import { closeTestingConnections, createTestingConnections, reloadTestingDatabases } from "../../utils/test-utils"
 import { Post } from "./entities"
 
-describe("duckdb > basic", () => {
+describe.only("duckdb > basic", () => {
     let connections: DataSource[]
-    before(
-        async () =>
-            (connections = await createTestingConnections({
-                entities: [Post],
-                enabledDrivers: ["duckdb"],
-            })),
-    )
+    before(async () => {
+        console.warn("before")
+        connections = await createTestingConnections({
+            entities: [Post],
+            enabledDrivers: ["duckdb"],
+        })
+        console.warn("before done")
+    })
     beforeEach(() => reloadTestingDatabases(connections))
     after(() => closeTestingConnections(connections))
 
@@ -69,7 +70,7 @@ describe("duckdb > basic", () => {
             }),
         ))
 
-    it("should persist entity successfully and after persistence have generated object id", () =>
+    it.only("should persist entity successfully and after persistence have generated object id", () =>
         Promise.all(
             connections.map(async (connection) => {
                 const postRepository = connection.getRepository(Post)
